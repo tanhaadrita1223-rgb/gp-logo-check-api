@@ -2,10 +2,9 @@ import os
 import io
 import json
 import base64
-import logging
 from typing import Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Query, HTTPException
+from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
@@ -16,35 +15,19 @@ from openai import OpenAI
 # Config
 # -----------------------------
 SERVICE_NAME = "gp-logo-check-api"
-BUILD_TAG = "debug-2026-02-07-001"
-
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
 
-# Supported ratios (tolerance lets minor resize/crop pass)
 RATIO_TOL = 0.02  # +/- 2%
 
-# Allowed ratios by asset type (you can expand later)
-# NOTE: using labels and numeric (w/h)
 ASSET_RATIOS = {
-    # Facebook
-    "facebook_feed": {
-        "1:1": 1.0,
-        "4:5": 4 / 5,
-        "16:9": 16 / 9,
-        "5:4": 5 / 4,
-    },
+    "facebook_feed": {"1:1": 1.0, "4:5": 4 / 5, "16:9": 16 / 9, "5:4": 5 / 4},
     "facebook_story": {"9:16": 9 / 16},
-
-    # Instagram
     "instagram_feed": {"1:1": 1.0, "4:5": 4 / 5, "16:9": 16 / 9},
     "instagram_story": {"9:16": 9 / 16},
     "instagram_reel": {"9:16": 9 / 16},
-
-    # Generic
     "video": {"9:16": 9 / 16, "16:9": 16 / 9, "1:1": 1.0},
 }
 
-# Safe-area margins (normalized)
 SAFE_AREA_BY_RATIO = {
     "9:16": {"left": 0.10, "right": 0.90, "top": 0.08, "bottom": 0.92},
     "4:5":  {"left": 0.10, "right": 0.90, "top": 0.08, "bottom": 0.92},
@@ -53,17 +36,9 @@ SAFE_AREA_BY_RATIO = {
     "16:9": {"left": 0.10, "right": 0.90, "top": 0.12, "bottom": 0.88},
 }
 
-# If logo center falls in these OUTSIDE-safe-area regions => OK
 ALLOWED_REGION_NAMES = [
     "top_left", "top_right", "bottom_left", "bottom_right", "top_band", "bottom_band"
 ]
-
-
-# -----------------------------
-# Logging
-# -----------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(SERVICE_NAME)
 
 
 # -----------------------------
@@ -80,7 +55,6 @@ def _load_asset_bytes(filename: str) -> Optional[Tuple[bytes, str]]:
         return None
     with open(path, "rb") as f:
         data = f.read()
-    # these are pngs in your repo
     return data, "image/png"
 
 
@@ -157,7 +131,6 @@ def _placement_ok_and_offset(cx: float, cy: float, w: int, h: int, safe: Dict[st
     if region in ALLOWED_REGION_NAMES:
         return True, region, {"dx_px": 0, "dy_px": 0, "suggestion": "OK"}
 
-    # If in center safe area, push to nearest boundary
     nx = cx / w
     ny = cy / h
 
@@ -171,10 +144,12 @@ def _placement_ok_and_offset(cx: float, cy: float, w: int, h: int, safe: Dict[st
     d_top = abs(ny - top)
     d_bottom = abs(bottom - ny)
 
-    candidates = [("left", d_left), ("right", d_right), ("top", d_top), ("bottom", d_bottom)]
-    direction = sorted(candidates, key=lambda x: x[1])[0][0]
-
     eps = 0.005
+    direction = sorted(
+        [("left", d_left), ("right", d_right), ("top", d_top), ("bottom", d_bottom)],
+        key=lambda x: x[1],
+    )[0][0]
+
     target_nx, target_ny = nx, ny
     if direction == "left":
         target_nx = left - eps
@@ -188,45 +163,45 @@ def _placement_ok_and_offset(cx: float, cy: float, w: int, h: int, safe: Dict[st
     dx_px = int(round((target_nx - nx) * w))
     dy_px = int(round((target_ny - ny) * h))
 
-    hint_x = ""
-    hint_y = ""
-    if dx_px < 0:
-        hint_x = f"{abs(dx_px)}px left"
-    elif dx_px > 0:
-        hint_x = f"{abs(dx_px)}px right"
-    if dy_px < 0:
-        hint_y = f"{abs(dy_px)}px up"
-    elif dy_px > 0:
-        hint_y = f"{abs(dy_px)}px down"
+    def _fmt(dx, dy):
+        parts = []
+        if dx != 0:
+            parts.append(f"{abs(dx)}px {'left' if dx < 0 else 'right'}")
+        if dy != 0:
+            parts.append(f"{abs(dy)}px {'up' if dy < 0 else 'down'}")
+        return " and ".join(parts) if parts else "0px"
 
-    suggestion = "Move logo " + " and ".join([p for p in [hint_x, hint_y] if p]).strip()
-    if suggestion == "Move logo":
-        suggestion = "Move logo slightly outside safe area"
-
-    return False, region, {"dx_px": dx_px, "dy_px": dy_px, "suggestion": suggestion}
+    return False, region, {
+        "dx_px": dx_px,
+        "dy_px": dy_px,
+        "suggestion": f"Move logo {_fmt(dx_px, dy_px)}",
+    }
 
 
-# ✅ Updated client getter:
-# Supports BOTH env names:
+# ✅ IMPORTANT: supports BOTH env var names:
 # - OPENAI_API_KEY (recommended)
-# - OPEN_AI_API (your Render screenshot shows this)
+# - OPEN_AI_API (your Render env group screenshot shows this one)
 def _get_openai_client() -> OpenAI:
-    key = (os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_AI_API") or "").strip()
+    key = (
+        os.getenv("OPENAI_API_KEY")
+        or os.getenv("OPEN_AI_API")
+        or os.getenv("OPENAI_KEY")
+    )
     if not key:
-        raise RuntimeError("Missing OpenAI API key. Set OPENAI_API_KEY (or OPEN_AI_API) in Render env vars.")
+        raise RuntimeError("Missing OpenAI key. Set OPENAI_API_KEY (recommended) or OPEN_AI_API in Render env vars.")
     return OpenAI(api_key=key)
 
 
 def _extract_bbox_with_openai(image_bytes: bytes, mime: str) -> Dict[str, Any]:
     """
-    Uses OpenAI vision to locate ONLY the GP symbol (blue 3-lobed icon).
-    Returns strict JSON:
+    Detect ONLY the GP symbol (the blue three-lobed icon).
+    Return strict JSON:
       {logo_detected:boolean, confidence:number 0..1, bbox:{x_min,y_min,x_max,y_max} or null}
     """
     client = _get_openai_client()
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # fastest cheap default
 
     img_data_url = _img_to_b64_data_url(image_bytes, mime)
-
     ref1 = _load_asset_bytes("gp_logo.png")
     ref2 = _load_asset_bytes("gp_logo_white.png")
 
@@ -234,40 +209,39 @@ def _extract_bbox_with_openai(image_bytes: bytes, mime: str) -> Dict[str, Any]:
         {
             "type": "input_text",
             "text": (
-                "Task: Detect ONLY the 'GP' symbol (the blue three-lobed icon), not the text 'gpfi'.\n"
-                "Return ONLY strict JSON with keys:\n"
-                "  logo_detected (boolean), confidence (number 0..1), bbox (object or null).\n"
-                "bbox must be pixel coordinates in the FIRST image:\n"
-                "  {x_min:int, y_min:int, x_max:int, y_max:int}\n"
-                "If no GP symbol is visible: logo_detected=false, bbox=null, confidence=0.\n"
-                "No extra text. JSON only."
+                "Task: detect ONLY the GP symbol (the blue 3-lobed icon), not text like 'gpfi'. "
+                "Return ONLY strict JSON with keys: "
+                "{\"logo_detected\": boolean, \"confidence\": number, "
+                "\"bbox\": {\"x_min\": int, \"y_min\": int, \"x_max\": int, \"y_max\": int} | null}. "
+                "The bbox must tightly cover the GP symbol in the FIRST image. "
+                "If not present, set logo_detected=false, bbox=null, confidence=0."
             ),
         },
         {"type": "input_image", "image_url": img_data_url},
     ]
 
-    # Add reference logo images (helps the model)
+    # Optional references (helps a lot)
     if ref1:
         content.append({"type": "input_image", "image_url": _img_to_b64_data_url(ref1[0], ref1[1])})
     if ref2:
         content.append({"type": "input_image", "image_url": _img_to_b64_data_url(ref2[0], ref2[1])})
 
     resp = client.responses.create(
-        model="gpt-4.1-mini",
+        model=model,
         input=[{"role": "user", "content": content}],
     )
 
     text = (resp.output_text or "").strip()
 
-    # Robust parse (in case model wraps JSON)
+    # Robust JSON parse
     try:
         return json.loads(text)
     except Exception:
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
-            return json.loads(text[start : end + 1])
-        raise RuntimeError(f"OpenAI returned non-JSON output: {text[:300]}")
+            return json.loads(text[start:end + 1])
+        raise RuntimeError(f"OpenAI returned non-JSON output: {text[:250]}")
 
 
 # -----------------------------
@@ -297,16 +271,17 @@ def root():
     return {
         "ok": True,
         "service": SERVICE_NAME,
-        "build_tag": BUILD_TAG,
         "routes": ["/", "/health", "/check", "/docs"],
         "assets_folder_exists": assets_exists,
         "assets": assets_list,
+        "openai_env_found": bool(os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_AI_API") or os.getenv("OPENAI_KEY")),
+        "openai_model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
     }
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": SERVICE_NAME, "build_tag": BUILD_TAG}
+    return {"ok": True}
 
 
 @app.post("/check")
@@ -314,85 +289,67 @@ async def check(
     file: UploadFile = File(...),
     asset: str = Query("facebook_feed", description="e.g. facebook_feed, instagram_story, video"),
 ):
+    img_bytes = await file.read()
+    mime = file.content_type or "image/jpeg"
+
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    w, h = img.size
+    ratio_lbl, ratio_val = _ratio_label(w, h)
+
+    matched_ratio = _match_asset_ratio(asset, ratio_val)
+    safe = _norm_safe_area(ratio_lbl)
+
+    # OpenAI call (wrapped so you don't get random 500s)
+    openai_error = None
+    logo_data: Dict[str, Any] = {"logo_detected": False, "confidence": 0, "bbox": None}
+
     try:
-        # Read image
-        img_bytes = await file.read()
-        if not img_bytes:
-            raise HTTPException(status_code=400, detail="Empty file uploaded.")
-
-        mime = (file.content_type or "image/jpeg").strip()
-
-        # PIL load
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        w, h = img.size
-        r = w / h
-
-        ratio_lbl, ratio_val = _ratio_label(w, h)
-        matched_ratio = _match_asset_ratio(asset, r)
-
-        safe = _norm_safe_area(ratio_lbl)
-
-        # Call OpenAI to get bbox
         logo_data = _extract_bbox_with_openai(img_bytes, mime)
-
-        logo_detected = bool(logo_data.get("logo_detected", False))
-        confidence = float(logo_data.get("confidence", 0) or 0)
-        bbox = logo_data.get("bbox", None)
-
-        logo_position = "unknown"
-        placement_ok = None
-        placement_reason = None
-        placement_offset = None
-
-        if logo_detected and bbox and safe:
-            cx, cy = _logo_center_from_bbox(bbox)
-            ok, region2, offset = _placement_ok_and_offset(cx, cy, w, h, safe)
-            logo_position = region2
-            placement_ok = ok
-            placement_offset = offset
-            placement_reason = "OK" if ok else "Logo center is inside safe area."
-
-        elif logo_detected and bbox and not safe:
-            logo_position = "detected_but_ratio_unknown"
-            placement_ok = None
-            placement_reason = "Logo detected, but image ratio is not supported for safe-area placement rules."
-
-        return {
-            "service": SERVICE_NAME,
-            "build_tag": BUILD_TAG,
-
-            "width": w,
-            "height": h,
-            "ratio": round(ratio_val, 4),
-
-            "asset": asset,
-            "asset_ratio_allowed": bool(matched_ratio is not None),
-            "matched_ratio_label": matched_ratio,   # allowed ratio label for that asset
-            "ratio_label": ratio_lbl,               # detected common ratio label
-            "safe_area_norm": safe,                 # margins if known
-
-            "logo_detected": logo_detected,
-            "confidence": round(confidence, 3),
-            "logo_bbox": bbox,                      # pixel bbox if present
-
-            "logo_position": logo_position,
-            "placement_ok": placement_ok,
-            "placement_reason": placement_reason,
-            "placement_offset": placement_offset,   # dx/dy pixel suggestion
-        }
-
-    except HTTPException:
-        raise
     except Exception as e:
-        # IMPORTANT: return the real reason in JSON so Swagger shows it
-        logger.exception("check() failed")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "Internal Server Error",
-                "message": str(e),
-                "hint": "Check Render Logs for full traceback. Also confirm OPENAI_API_KEY (or OPEN_AI_API) is set.",
-                "service": SERVICE_NAME,
-                "build_tag": BUILD_TAG,
-            },
-        )
+        # Keep API alive (no 500), but report error in JSON
+        openai_error = str(e)
+
+    logo_detected = bool(logo_data.get("logo_detected", False))
+    confidence = float(logo_data.get("confidence", 0) or 0)
+    bbox = logo_data.get("bbox", None)
+
+    logo_position = "unknown"
+    placement_ok = None
+    placement_reason = None
+    placement_offset = None
+
+    if logo_detected and bbox and safe:
+        cx, cy = _logo_center_from_bbox(bbox)
+        region = _classify_logo_region(cx, cy, w, h, safe)
+        ok, region2, offset = _placement_ok_and_offset(cx, cy, w, h, safe)
+
+        logo_position = region2
+        placement_ok = ok
+        placement_offset = offset
+        placement_reason = "OK" if ok else f"Logo center is inside safe area ({region})."
+
+    elif logo_detected and bbox and not safe:
+        logo_position = "detected_but_ratio_unknown"
+        placement_reason = "Logo detected, but image ratio is not supported for safe-area rules."
+
+    return {
+        "width": w,
+        "height": h,
+        "ratio": round(ratio_val, 4),
+        "asset": asset,
+        "asset_ratio_allowed": bool(matched_ratio is not None),
+        "matched_ratio_label": matched_ratio,
+        "ratio_label": ratio_lbl,
+        "safe_area_norm": safe,
+
+        "logo_detected": logo_detected,
+        "confidence": round(confidence, 3),
+        "logo_bbox": bbox,
+        "logo_position": logo_position,
+        "placement_ok": placement_ok,
+        "placement_reason": placement_reason,
+        "placement_offset": placement_offset,
+
+        # Helps you debug without breaking the bot
+        "openai_error": openai_error,
+    }
