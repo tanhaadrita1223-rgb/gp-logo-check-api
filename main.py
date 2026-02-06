@@ -338,6 +338,18 @@ async def check(
 
     # Call OpenAI to get bbox
     logo_data = _extract_bbox_with_openai(img_bytes, mime)
+except Exception as e:
+    # This will show the real cause in Swagger + Render logs
+    return {
+        "error": "OpenAI call failed",
+        "details": str(e),
+        "hint": "Check OPENAI_API_KEY env var + model name + openai package version",
+        "width": w,
+        "height": h,
+        "ratio": round(ratio_val, 4),
+        "asset": asset,
+        "ratio_label": ratio_lbl,
+    }
 
     logo_detected = bool(logo_data.get("logo_detected", False))
     confidence = float(logo_data.get("confidence", 0) or 0)
