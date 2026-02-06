@@ -2,8 +2,11 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import cv2
+from PIL import Image
+import io
+import os
 
-app = FastAPI(title="GP Logo Check API", version="1.1.0")
+app = FastAPI(title="GP Logo Check API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -13,161 +16,144 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-TEMPLATE_PATH = "gp_logo_template.png"
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "gp_logo_template.png")
 
-def _load_and_prepare_template():
-    tpl_bgr = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_COLOR)
-    if tpl_bgr is None:
-        raise RuntimeError(f"Template not found at {TEMPLATE_PATH}")
+def load_image_bytes(image_bytes: bytes):
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    np_img = np.array(img)  # RGB
+    bgr = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+    return bgr, w, h
 
-    # Convert to gray
-    tpl_gray = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
+def load_template():
+    if not os.path.exists(TEMPLATE_PATH):
+        raise FileNotFoundError(f"Template not found: {TEMPLATE_PATH}")
+    tpl = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_UNCHANGED)
+    if tpl is None:
+        raise ValueError("Failed to read template image")
+    # Convert to BGR if has alpha
+    if tpl.shape[-1] == 4:
+        tpl = cv2.cvtColor(tpl, cv2.COLOR_BGRA2BGR)
+    return tpl
 
-    # Remove white background by auto-cropping to non-white pixels
-    # Anything darker than ~245 is considered part of the logo (works for blue-on-white)
-    mask = (tpl_gray < 245).astype(np.uint8) * 255
-    coords = cv2.findNonZero(mask)
-    if coords is None:
-        raise RuntimeError("Template looks empty after background removal")
+def match_logo(image_bgr, template_bgr):
+    """
+    Multi-scale template matching.
+    Returns best match: (found: bool, bbox, confidence)
+    bbox: (x_min, y_min, x_max, y_max)
+    """
+    img_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    tpl_gray_orig = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
 
-    x, y, w, h = cv2.boundingRect(coords)
-    tpl_crop = tpl_gray[y:y+h, x:x+w]
-
-    # Edge template (more robust)
-    tpl_edge = cv2.Canny(tpl_crop, 50, 150)
-
-    return tpl_edge
-
-TEMPLATE_EDGE = _load_and_prepare_template()
-
-def _match_logo_bbox(img_bgr: np.ndarray):
-    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    # Light edge emphasis helps avoid matching big text/blocks
+    img_gray = cv2.GaussianBlur(img_gray, (3, 3), 0)
     img_edge = cv2.Canny(img_gray, 50, 150)
 
-    best = None  # (score, x, y, w, h)
+    best_val = -1.0
+    best_bbox = None
 
-    # Multi-scale matching (handles different logo sizes)
-    tpl0 = TEMPLATE_EDGE
-    th0, tw0 = tpl0.shape[:2]
+    h_img, w_img = img_edge.shape[:2]
 
-    scales = [1.25, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6]
+    # scales: small → larger
+    scales = [0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 1.0, 1.15, 1.3]
+
     for s in scales:
-        tw = int(tw0 * s)
-        th = int(th0 * s)
-        if tw < 15 or th < 15:
-            continue
-        if tw >= img_edge.shape[1] or th >= img_edge.shape[0]:
+        tpl = cv2.resize(tpl_gray_orig, (0, 0), fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        th, tw = tpl.shape[:2]
+
+        # Skip if template bigger than image
+        if th >= h_img or tw >= w_img or th < 10 or tw < 10:
             continue
 
-        tpl = cv2.resize(tpl0, (tw, th), interpolation=cv2.INTER_AREA)
+        tpl_blur = cv2.GaussianBlur(tpl, (3, 3), 0)
+        tpl_edge = cv2.Canny(tpl_blur, 50, 150)
 
-        res = cv2.matchTemplate(img_edge, tpl, cv2.TM_CCOEFF_NORMED)
+        res = cv2.matchTemplate(img_edge, tpl_edge, cv2.TM_CCOEFF_NORMED)
         min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
 
-        if best is None or max_val > best[0]:
-            best = (float(max_val), int(max_loc[0]), int(max_loc[1]), int(tw), int(th))
+        if max_val > best_val:
+            x, y = max_loc
+            best_val = float(max_val)
+            best_bbox = (int(x), int(y), int(x + tw), int(y + th))
 
-    return best  # or None
+    # threshold: tuneable
+    found = best_bbox is not None and best_val >= 0.55
+    return found, best_bbox, best_val
 
-def _position_label(cx_norm: float, cy_norm: float):
+def logo_position_from_bbox(bbox, w, h):
+    x1, y1, x2, y2 = bbox
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+
     # 3x3 grid
-    if cx_norm < 1/3:
-        xlab = "left"
-    elif cx_norm > 2/3:
-        xlab = "right"
-    else:
-        xlab = "center"
+    col = "left" if cx < w/3 else ("right" if cx > 2*w/3 else "center")
+    row = "top" if cy < h/3 else ("bottom" if cy > 2*h/3 else "middle")
 
-    if cy_norm < 1/3:
-        ylab = "top"
-    elif cy_norm > 2/3:
-        ylab = "bottom"
-    else:
-        ylab = "center"
-
-    if xlab == "center" and ylab == "center":
+    if row == "middle" and col == "center":
         return "center"
-    if xlab == "center":
-        return ylab
-    if ylab == "center":
-        return xlab
-    return f"{ylab}_{xlab}"  # top_left, top_right, bottom_left, bottom_right
+    if row == "middle":
+        return col
+    if col == "center":
+        return row
+    return f"{row}_{col}"
 
-def _placement_ok(position: str, cx_norm: float, cy_norm: float):
-    # Rules:
-    # - NOT ok if it's in the center area (we already label "center")
-    # - OK if it is in any corner OR edge zones
-    # - Also require it isn't too close to exact border (avoid cut-off): margin >= 1.5%
-    margin = 0.015
-    if cx_norm < margin or cx_norm > 1 - margin or cy_norm < margin or cy_norm > 1 - margin:
-        return False, "Logo too close to the edge (risk of cut-off)."
+def placement_ok(bbox, w, h):
+    """
+    Define "allowed safe corners" (top-left/top-right/bottom-left/bottom-right)
+    as 0-25% of width/height areas.
+    If logo bbox lies fully inside any of these corner safe boxes => OK.
+    """
+    x1, y1, x2, y2 = bbox
+    safe_w = int(w * 0.25)
+    safe_h = int(h * 0.25)
 
-    if position == "center":
-        return False, "Logo is in the center area. Should be placed on an edge/corner."
+    corners = {
+        "top_left": (0, 0, safe_w, safe_h),
+        "top_right": (w - safe_w, 0, w, safe_h),
+        "bottom_left": (0, h - safe_h, safe_w, h),
+        "bottom_right": (w - safe_w, h - safe_h, w, h),
+    }
 
-    # Everything else is allowed (top_left/top_right/bottom_left/bottom_right/top/bottom/left/right)
-    return True, "Logo placement looks acceptable."
+    for name, (cx1, cy1, cx2, cy2) in corners.items():
+        if x1 >= cx1 and y1 >= cy1 and x2 <= cx2 and y2 <= cy2:
+            return True, f"Inside safe corner zone: {name}"
+
+    return False, "Logo is not inside a safe corner zone (25% x 25%)."
 
 @app.get("/")
 def root():
-    return {"ok": True, "message": "Use POST /check with multipart file field 'file'."}
+    return {"ok": True, "message": "Use POST /check or /docs"}
 
 @app.post("/check")
 async def check_logo(file: UploadFile = File(...)):
     data = await file.read()
-    nparr = np.frombuffer(data, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    image_bgr, w, h = load_image_bytes(data)
 
-    if img is None:
-        return {"error": "Could not decode image. Please upload a valid JPG/PNG."}
+    template_bgr = load_template()
+    found, bbox, conf = match_logo(image_bgr, template_bgr)
 
-    h, w = img.shape[:2]
-
-    best = _match_logo_bbox(img)
-    if best is None:
+    if not found:
         return {
             "logo_detected": False,
+            "confidence": conf,
             "width": w,
             "height": h,
-            "score": 0.0,
-            "message": "No match candidates."
+            "logo_position": "none",
+            "bbox": None,
+            "placement_ok": False,
+            "placement_reason": "Logo not detected reliably."
         }
 
-    score, x, y, tw, th = best
-
-    # Threshold: adjust if needed; with edges this is usually stable
-    detected = score >= 0.35
-
-    if not detected:
-        return {
-            "logo_detected": False,
-            "width": w,
-            "height": h,
-            "score": score,
-            "message": "Match score below threshold."
-        }
-
-    x_min = max(0, x)
-    y_min = max(0, y)
-    x_max = min(w - 1, x + tw)
-    y_max = min(h - 1, y + th)
-
-    cx = (x_min + x_max) / 2.0
-    cy = (y_min + y_max) / 2.0
-    cx_norm = cx / w
-    cy_norm = cy / h
-
-    pos = _position_label(cx_norm, cy_norm)
-    ok, reason = _placement_ok(pos, cx_norm, cy_norm)
+    pos = logo_position_from_bbox(bbox, w, h)
+    ok, reason = placement_ok(bbox, w, h)
 
     return {
         "logo_detected": True,
+        "confidence": conf,
         "width": w,
         "height": h,
-        "score": score,
         "logo_position": pos,
+        "bbox": {"x_min": bbox[0], "y_min": bbox[1], "x_max": bbox[2], "y_max": bbox[3]},
         "placement_ok": ok,
-        "placement_reason": reason,
-        "bbox": {"x_min": int(x_min), "y_min": int(y_min), "x_max": int(x_max), "y_max": int(y_max)},
-        "center_norm": {"cx": round(cx_norm, 4), "cy": round(cy_norm, 4)},
+        "placement_reason": reason
     }
