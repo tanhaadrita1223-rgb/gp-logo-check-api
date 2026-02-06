@@ -221,9 +221,12 @@ def _placement_ok_and_offset(cx: float, cy: float, w: int, h: int, safe: Dict[st
 
 
 def _get_openai_client() -> OpenAI:
-    key = os.getenv("OPENAI_API_KEY")
+    # Support both env var names to avoid Render / human mistakes
+    key = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_AI_API")
     if not key:
-        raise RuntimeError("Missing OPENAI_API_KEY in environment variables.")
+        raise RuntimeError(
+            "Missing OPENAI_API_KEY (or OPEN_AI_API) in environment variables."
+        )
     return OpenAI(api_key=key)
 
 
