@@ -6,7 +6,6 @@ import os
 
 app = FastAPI(title="GP Logo Check API")
 
-# Allow all origins (safe for now)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,7 +13,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------- SAFE AREAS BY RATIO --------
 SAFE_AREAS = {
     "9:16": {"left": 0.1, "right": 0.9, "top": 0.1, "bottom": 0.9},
     "4:5":  {"left": 0.1, "right": 0.9, "top": 0.08, "bottom": 0.92},
@@ -23,21 +21,31 @@ SAFE_AREAS = {
     "16:9": {"left": 0.1, "right": 0.9, "top": 0.12, "bottom": 0.88},
 }
 
-# -------- HEALTH CHECK --------
-@app.get("/health")
-def health():
+def list_assets():
     assets_path = "assets"
-    templates = []
-    if os.path.exists(assets_path):
-        templates = os.listdir(assets_path)
+    if not os.path.exists(assets_path):
+        return []
+    return sorted(os.listdir(assets_path))
 
+@app.get("/")
+def root():
+    # This ensures your base URL never returns "Not Found"
     return {
         "ok": True,
-        "templates_loaded": len(templates),
-        "templates": templates
+        "service": "gp-logo-check-api",
+        "routes": ["/", "/health", "/check"],
+        "assets_folder_exists": os.path.exists("assets"),
+        "assets": list_assets(),
     }
 
-# -------- CHECK ENDPOINT --------
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "templates_loaded": len(list_assets()),
+        "templates": list_assets(),
+    }
+
 @app.post("/check")
 async def check_logo(file: UploadFile = File(...)):
     image_bytes = await file.read()
@@ -46,15 +54,15 @@ async def check_logo(file: UploadFile = File(...)):
 
     ratio = round(width / height, 2)
 
-    if abs(ratio - 0.56) < 0.02:
+    if abs(ratio - 0.56) < 0.03:
         ratio_label = "9:16"
-    elif abs(ratio - 0.8) < 0.02:
+    elif abs(ratio - 0.8) < 0.03:
         ratio_label = "4:5"
-    elif abs(ratio - 1.0) < 0.02:
+    elif abs(ratio - 1.0) < 0.03:
         ratio_label = "1:1"
-    elif abs(ratio - 1.25) < 0.02:
+    elif abs(ratio - 1.25) < 0.03:
         ratio_label = "5:4"
-    elif abs(ratio - 1.78) < 0.02:
+    elif abs(ratio - 1.78) < 0.05:
         ratio_label = "16:9"
     else:
         ratio_label = "unknown"
